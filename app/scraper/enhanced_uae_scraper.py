@@ -555,32 +555,66 @@ class EnhancedUAEScraper:
             return None
 
     def extract_image_from_element(self, element, base_url: str) -> Optional[str]:
-        """Try to extract image URL from the listing/card element."""
+        """Try to extract image URL from the listing/card element with enhanced lazy loading support."""
         try:
-            # common attributes across sites
-            img = element.select_one('img')
-            if img:
+            # Find all img elements in the card
+            imgs = element.select('img')
+            
+            for img in imgs:
+                # Skip placeholder SVGs (common in lazy loading)
+                src_val = img.get('src', '')
+                if 'data:image/svg+xml' in src_val:
+                    # This is a placeholder, look for lazy loading attributes
+                    logger.debug(f"Found lazy loading placeholder SVG, checking data attributes: {list(img.attrs.keys())}")
+                    continue
+                
                 # Prefer srcset highest quality
-                if img.has_attr('srcset') and img['srcset']:
+                if img.has_attr('srcset') and img['srcset'] and not 'data:image/svg+xml' in img['srcset']:
                     best = self._parse_srcset_best(img['srcset'], base_url)
-                    if best:
+                    if best and not 'data:image/svg+xml' in best:
                         return best
-                for attr in ['src', 'data-src', 'data-lazy-src', 'data-original']:
-                    val = img.get(attr)
-                    if val:
-                        return self._make_absolute(val, base_url)
+                
+                # Enhanced attribute checking for lazy loading
+                # Priority order: data-lazy-src, data-src, data-original, src
+                for attr in ['data-lazy-src', 'data-src', 'data-original', 'data-lazy-srcset', 'src']:
+                    val = img.get(attr, '')
+                    if val and not 'data:image/svg+xml' in val:
+                        # Handle srcset attributes
+                        if 'srcset' in attr and ',' in val:
+                            best = self._parse_srcset_best(val, base_url)
+                            if best and not 'data:image/svg+xml' in best:
+                                return best
+                        else:
+                            # Regular image URL
+                            result = self._make_absolute(val, base_url)
+                            if result and not 'data:image/svg+xml' in result:
+                                return result
+            
             # Some sites use picture/source
             source_el = element.select_one('source[srcset]')
             if source_el and source_el.get('srcset'):
-                best = self._parse_srcset_best(source_el['srcset'], base_url)
-                if best:
-                    return best
-        except Exception:
+                srcset_val = source_el.get('srcset')
+                if not 'data:image/svg+xml' in srcset_val:
+                    best = self._parse_srcset_best(srcset_val, base_url)
+                    if best and not 'data:image/svg+xml' in best:
+                        return best
+            
+            # Fallback: look for any data attribute containing image URLs
+            for img in imgs:
+                for attr_name, attr_value in img.attrs.items():
+                    if (attr_name.startswith('data-') and 
+                        isinstance(attr_value, str) and
+                        any(ext in attr_value.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']) and
+                        not 'data:image/svg+xml' in attr_value):
+                        return self._make_absolute(attr_value, base_url)
+                        
+        except Exception as e:
+            logger.debug(f"Error extracting image from element: {e}")
             pass
         return None
 
-    async def fetch_image_from_article_page(self, article_url: str, session: aiohttp.ClientSession, timeout: int = 10) -> Optional[str]:
-        """Fetch article page and read og:image/twitter:image/JSON-LD image as fallback."""
+    async def fetch_article_content(self, article_url: str, session: aiohttp.ClientSession, timeout: int = 10) -> tuple[Optional[str], Optional[str]]:
+        """Fetch article page and extract both image and text content."""
         try:
             await self.respect_rate_limit()
             headers = {
@@ -590,12 +624,14 @@ class EnhancedUAEScraper:
             }
             async with session.get(article_url, headers=headers, timeout=timeout) as response:
                 if response.status != 200:
-                    return None
+                    return None, None
                 html = await response.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 base_url = article_url
-
-                # Meta tags
+                
+                # Extract image
+                image_url = None
+                # Meta tags (preferred for article pages)
                 for selector, attr in [
                     ("meta[property='og:image:secure_url']", 'content'),
                     ("meta[property='og:image']", 'content'),
@@ -604,27 +640,98 @@ class EnhancedUAEScraper:
                 ]:
                     tag = soup.select_one(selector)
                     if tag and tag.get(attr):
-                        return self._make_absolute(tag.get(attr), base_url)
+                        potential_url = tag.get(attr)
+                        if not 'data:image/svg+xml' in potential_url:
+                            image_url = self._make_absolute(potential_url, base_url)
+                            break
 
-                # JSON-LD
-                try:
-                    for script in soup.select("script[type='application/ld+json']"):
-                        data = json.loads(script.get_text(strip=True) or '{}')
-                        # Article schema may be an array or object
-                        items = data if isinstance(data, list) else [data]
-                        for item in items:
-                            img = item.get('image')
-                            if isinstance(img, str):
-                                return self._make_absolute(img, base_url)
-                            if isinstance(img, list) and img:
-                                return self._make_absolute(img[0], base_url)
-                            if isinstance(img, dict) and img.get('url'):
-                                return self._make_absolute(img['url'], base_url)
-                except Exception:
-                    pass
-        except Exception:
-            return None
-        return None
+                # JSON-LD for image
+                if not image_url:
+                    try:
+                        for script in soup.select("script[type='application/ld+json']"):
+                            data = json.loads(script.get_text(strip=True) or '{}')
+                            items = data if isinstance(data, list) else [data]
+                            for item in items:
+                                img = item.get('image')
+                                if isinstance(img, str):
+                                    image_url = self._make_absolute(img, base_url)
+                                    break
+                                if isinstance(img, list) and img:
+                                    image_url = self._make_absolute(img[0], base_url)
+                                    break
+                                if isinstance(img, dict) and img.get('url'):
+                                    image_url = self._make_absolute(img['url'], base_url)
+                                    break
+                            if image_url:
+                                break
+                    except Exception:
+                        pass
+                
+                # Fallback: look for actual img elements with lazy loading support
+                if not image_url:
+                    # Look for main article image
+                    for img_selector in ['article img:first-of-type', '.article-content img:first-of-type', '.entry-content img:first-of-type', 'img']:
+                        img_elements = soup.select(img_selector)
+                        for img in img_elements:
+                            # Skip placeholder SVGs
+                            src_val = img.get('src', '')
+                            if 'data:image/svg+xml' in src_val:
+                                continue
+                                
+                            # Check lazy loading attributes
+                            for attr in ['data-lazy-src', 'data-src', 'data-original', 'src']:
+                                val = img.get(attr, '')
+                                if val and not 'data:image/svg+xml' in val and any(ext in val.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
+                                    image_url = self._make_absolute(val, base_url)
+                                    break
+                            if image_url:
+                                break
+                        if image_url:
+                            break
+                
+                # Extract text content (first paragraph/lead)
+                text_content = None
+                
+                # Try multiple selectors for article content
+                content_selectors = [
+                    # Common article content selectors
+                    'article p:first-of-type',
+                    '.article-content p:first-of-type',
+                    '.entry-content p:first-of-type',
+                    '.post-content p:first-of-type',
+                    '.story-content p:first-of-type',
+                    '[class*="article"] p:first-of-type',
+                    '[class*="story"] p:first-of-type',
+                    '[class*="content"] p:first-of-type',
+                    # Fallback to any paragraph with substantial text
+                    'p'
+                ]
+                
+                for selector in content_selectors:
+                    elements = soup.select(selector)
+                    for elem in elements:
+                        potential_text = self.clean_text(elem.get_text(strip=True))
+                        # Look for substantial first paragraph (not just short captions/metadata)
+                        if potential_text and len(potential_text) >= 50 and not any(skip_word in potential_text.lower() for skip_word in ['image:', 'photo:', 'getty', 'reuters', 'ap photo', 'file photo']):
+                            text_content = potential_text[:500]  # Limit to 500 chars
+                            break
+                    if text_content:
+                        break
+                
+                # Fallback: try meta description
+                if not text_content:
+                    meta_desc = soup.select_one("meta[name='description']")
+                    if meta_desc and meta_desc.get('content'):
+                        desc = self.clean_text(meta_desc.get('content'))
+                        if len(desc) >= 30:
+                            text_content = desc[:500]
+                
+                return image_url, text_content
+                
+        except Exception as e:
+            logger.warning(f"Error fetching article content from {article_url}: {e}")
+            return None, None
+        return None, None
     
     async def respect_rate_limit(self):
         """Enhanced rate limiting with exponential backoff"""
@@ -892,17 +999,29 @@ class EnhancedUAEScraper:
         
         for attempt in range(3):
             try:
-                # Resolve image if missing by fetching article page quickly
-                if not article.image_url:
-                    resolved = await self.fetch_image_from_article_page(article.url, session)
-                    if resolved:
-                        article.image_url = resolved
+                # Fetch both image and text content from article page
+                resolved_image, resolved_text = await self.fetch_article_content(article.url, session)
+                
+                # Use resolved image if article doesn't have one
+                if not article.image_url and resolved_image:
+                    article.image_url = resolved_image
+                
+                # Use resolved text content, fallback to summary, then headline
+                text_content = ""
+                if resolved_text and len(resolved_text.strip()) >= 30:
+                    text_content = resolved_text.strip()
+                elif article.summary and len(article.summary.strip()) >= 20:
+                    text_content = article.summary.strip()
+                else:
+                    text_content = f"News article: {article.headline}"
                 
                 article_data = {
                     # Only required/expected fields by the current DB/API
                     "timestamp": article.scraped_at.isoformat(),
                     "link": article.url,
                     "title": article.headline,
+                    "text_content": text_content,  # Required field - never empty
+                    "source": article.source,  # Include the source field
                     "category": article.category,
                     "image_url": article.image_url or None
                 }
