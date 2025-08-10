@@ -178,17 +178,19 @@ class QuickFixScraper:
                     if summary_elem:
                         summary = self.clean_text(summary_elem.get_text(strip=True))
                     
-                    # Create article data
+                    # Pick image from card if available
+                    image_url = None
+                    img = element.select_one('img')
+                    if img:
+                        image_url = img.get('src') or img.get('data-src') or None
+
+                    # Create article data (only required fields)
                     article_data = {
                         "timestamp": datetime.utcnow().isoformat(),
-                        "text_content": summary or headline,
-                        "source": source_name,
                         "link": url,
                         "title": headline,
                         "category": "regional",
-                        "story_id": str(uuid.uuid4()),
-                        "keywords": self.extract_keywords(f"{headline} {summary}"),
-                        "is_primary_article": True
+                        "image_url": image_url
                     }
                     
                     articles.append(article_data)
@@ -213,7 +215,13 @@ class QuickFixScraper:
             
             async with session.post(
                 f"{self.api_base_url}/api/rss",
-                json=article_data,
+                json={
+                    "timestamp": article_data.get("timestamp"),
+                    "link": article_data.get("link"),
+                    "title": article_data.get("title"),
+                    "category": article_data.get("category"),
+                    "image_url": article_data.get("image_url")
+                },
                 headers={'Content-Type': 'application/json'},
                 timeout=10
             ) as response:

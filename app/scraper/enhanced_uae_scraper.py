@@ -44,6 +44,7 @@ class Article:
     summary: str = ""
     category: str = "general"
     keywords: Set[str] = None
+    image_url: Optional[str] = None
     scraped_at: datetime = None
     
     def __post_init__(self):
@@ -504,6 +505,126 @@ class EnhancedUAEScraper:
             "api_errors": [],
             "rate_limit_hits": 0
         }
+
+    def _make_absolute(self, possibly_relative_url: str, base_url: str) -> str:
+        """Ensure image/article URLs are absolute."""
+        try:
+            if not possibly_relative_url:
+                return ""
+            if possibly_relative_url.startswith("//"):
+                # Protocol-relative
+                return f"https:{possibly_relative_url}"
+            if possibly_relative_url.startswith("http"):
+                return possibly_relative_url
+            return urljoin(base_url, possibly_relative_url)
+        except Exception:
+            return possibly_relative_url or ""
+
+    def _parse_srcset_best(self, srcset_value: str, base_url: str) -> Optional[str]:
+        """Pick the highest resolution image from a srcset string."""
+        try:
+            candidates = []
+            for part in srcset_value.split(','):
+                item = part.strip()
+                if not item:
+                    continue
+                # format: url [width|x]
+                pieces = item.split()
+                url = self._make_absolute(pieces[0], base_url)
+                score = 0
+                if len(pieces) > 1:
+                    token = pieces[1].lower()
+                    if token.endswith('w'):
+                        # width like 640w
+                        try:
+                            score = int(token[:-1])
+                        except Exception:
+                            score = 0
+                    elif token.endswith('x'):
+                        # pixel density like 2x
+                        try:
+                            score = int(float(token[:-1]) * 1000)
+                        except Exception:
+                            score = 0
+                candidates.append((score, url))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            return candidates[0][1]
+        except Exception:
+            return None
+
+    def extract_image_from_element(self, element, base_url: str) -> Optional[str]:
+        """Try to extract image URL from the listing/card element."""
+        try:
+            # common attributes across sites
+            img = element.select_one('img')
+            if img:
+                # Prefer srcset highest quality
+                if img.has_attr('srcset') and img['srcset']:
+                    best = self._parse_srcset_best(img['srcset'], base_url)
+                    if best:
+                        return best
+                for attr in ['src', 'data-src', 'data-lazy-src', 'data-original']:
+                    val = img.get(attr)
+                    if val:
+                        return self._make_absolute(val, base_url)
+            # Some sites use picture/source
+            source_el = element.select_one('source[srcset]')
+            if source_el and source_el.get('srcset'):
+                best = self._parse_srcset_best(source_el['srcset'], base_url)
+                if best:
+                    return best
+        except Exception:
+            pass
+        return None
+
+    async def fetch_image_from_article_page(self, article_url: str, session: aiohttp.ClientSession, timeout: int = 10) -> Optional[str]:
+        """Fetch article page and read og:image/twitter:image/JSON-LD image as fallback."""
+        try:
+            await self.respect_rate_limit()
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+            async with session.get(article_url, headers=headers, timeout=timeout) as response:
+                if response.status != 200:
+                    return None
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                base_url = article_url
+
+                # Meta tags
+                for selector, attr in [
+                    ("meta[property='og:image:secure_url']", 'content'),
+                    ("meta[property='og:image']", 'content'),
+                    ("meta[name='twitter:image']", 'content'),
+                    ("link[rel='image_src']", 'href'),
+                ]:
+                    tag = soup.select_one(selector)
+                    if tag and tag.get(attr):
+                        return self._make_absolute(tag.get(attr), base_url)
+
+                # JSON-LD
+                try:
+                    for script in soup.select("script[type='application/ld+json']"):
+                        data = json.loads(script.get_text(strip=True) or '{}')
+                        # Article schema may be an array or object
+                        items = data if isinstance(data, list) else [data]
+                        for item in items:
+                            img = item.get('image')
+                            if isinstance(img, str):
+                                return self._make_absolute(img, base_url)
+                            if isinstance(img, list) and img:
+                                return self._make_absolute(img[0], base_url)
+                            if isinstance(img, dict) and img.get('url'):
+                                return self._make_absolute(img['url'], base_url)
+                except Exception:
+                    pass
+        except Exception:
+            return None
+        return None
     
     async def respect_rate_limit(self):
         """Enhanced rate limiting with exponential backoff"""
@@ -701,6 +822,9 @@ class EnhancedUAEScraper:
                     text_for_keywords = f"{headline} {summary}"
                     keywords = self.text_processor.extract_keywords(text_for_keywords)
                     
+                    # Try to get image from the card first
+                    image_url = self.extract_image_from_element(element, source_config["url"]) or None
+
                     # Create article
                     article = Article(
                         headline=headline,
@@ -708,7 +832,8 @@ class EnhancedUAEScraper:
                         source=source_config["name"],
                         summary=summary,
                         category=source_config.get("category", "general"),
-                        keywords=keywords
+                        keywords=keywords,
+                        image_url=image_url
                     )
                     
                     articles.append(article)
@@ -767,16 +892,19 @@ class EnhancedUAEScraper:
         
         for attempt in range(3):
             try:
+                # Resolve image if missing by fetching article page quickly
+                if not article.image_url:
+                    resolved = await self.fetch_image_from_article_page(article.url, session)
+                    if resolved:
+                        article.image_url = resolved
+                
                 article_data = {
+                    # Only required/expected fields by the current DB/API
                     "timestamp": article.scraped_at.isoformat(),
-                    "text_content": article.summary or article.headline,
-                    "source": article.source,
                     "link": article.url,
                     "title": article.headline,
                     "category": article.category,
-                    "story_id": str(uuid.uuid4()),
-                    "keywords": list(article.keywords),
-                    "is_primary_article": True
+                    "image_url": article.image_url or None
                 }
                 
                 # Add extra delay between API calls
@@ -869,10 +997,51 @@ class EnhancedUAEScraper:
             result.articles_found = len(articles)
             
             if len(articles) == 0:
-                result.status = 'failed'
-                result.error_details["no_articles"] = "No articles extracted"
-                logger.warning(f"⚠️ {source_config['name']} - No articles extracted")
-                return result
+                # Fallback to MCP bridge (Playwright via MCP) if configured externally
+                try:
+                    from app.scraper.mcp_bridge_client import extract_with_mcp_via_http
+                    logger.info(f"🧭 {source_config['name']} - Static parse failed, trying MCP bridge")
+                    mcp_items, diag = await extract_with_mcp_via_http(
+                        page_url=source_config["url"],
+                        selectors=source_config.get("selectors", {}),
+                        wait_for=source_config.get("selectors", {}).get("articles"),
+                        max_items=settings.max_articles_per_source,
+                    )
+                    result.error_details["mcp_bridge"] = diag
+                    if mcp_items:
+                        for it in mcp_items:
+                            try:
+                                url = it.get('link', '')
+                                if not url or url in self.scraped_urls:
+                                    continue
+                                article = Article(
+                                    headline=self.clean_text(it.get('headline', '')),
+                                    url=self._make_absolute(url, source_config["url"]),
+                                    source=source_config["name"],
+                                    summary=self.clean_text(it.get('summary', '')),
+                                    category=source_config.get("category", "general"),
+                                    keywords=self.text_processor.extract_keywords(f"{it.get('headline','')} {it.get('summary','')}") or set(),
+                                    image_url=it.get('image_url') or None
+                                )
+                                articles.append(article)
+                                self.scraped_urls.add(article.url)
+                            except Exception as e:
+                                logger.warning(f"⚠️ MCP item conversion error: {e}")
+                        result.articles_found = len(articles)
+                        if not articles:
+                            result.status = 'failed'
+                            result.error_details["no_articles"] = "No articles extracted (static + MCP)"
+                            return result
+                    else:
+                        result.status = 'failed'
+                        result.error_details["no_articles"] = "No articles extracted (static + MCP)"
+                        logger.warning(f"⚠️ {source_config['name']} - MCP returned no items")
+                        return result
+                except Exception as e:
+                    result.status = 'failed'
+                    result.error_details["mcp_bridge_error"] = str(e)
+                    logger.error(f"💥 {source_config['name']} - MCP bridge error: {e}")
+                    return result
             
             # Post articles with retry logic
             posted_count = 0

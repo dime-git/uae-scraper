@@ -64,7 +64,9 @@ class SimpleNewsScraper:
                                 "category": "regional",
                                 "story_id": str(uuid.uuid4()),
                                 "keywords": ["middle", "east", "news"],
-                                "is_primary_article": True
+                                "is_primary_article": True,
+                                # Best-effort image from card
+                                "image_url": (element.select_one('img[src]') or {}).get('src') if element.select_one('img[src]') else None
                             }
                             
                             articles.append(article_data)
@@ -97,7 +99,14 @@ class SimpleNewsScraper:
         try:
             async with session.post(
                 f"{self.api_base_url}/api/rss",
-                json=article_data,
+                # Send only the fields the DB/API expects currently
+                json={
+                    "timestamp": article_data.get("timestamp"),
+                    "link": article_data.get("link"),
+                    "title": article_data.get("title"),
+                    "category": article_data.get("category"),
+                    "image_url": article_data.get("image_url")
+                },
                 headers={'Content-Type': 'application/json'}
             ) as response:
                 return response.status in [200, 201]
