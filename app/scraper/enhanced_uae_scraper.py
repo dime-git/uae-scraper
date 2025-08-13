@@ -1116,17 +1116,17 @@ class EnhancedUAEScraper:
             result.articles_found = len(articles)
             
             if len(articles) == 0:
-                # Fallback to MCP bridge (Playwright via MCP) if configured externally
+                # Fallback to MCP direct (Playwright via MCP) - handles lazy loading & SVG placeholders
                 try:
-                    from app.scraper.mcp_bridge_client import extract_with_mcp_via_http
-                    logger.info(f"🧭 {source_config['name']} - Static parse failed, trying MCP bridge")
-                    mcp_items, diag = await extract_with_mcp_via_http(
+                    from app.scraper.mcp_bridge_client import extract_with_mcp_direct
+                    logger.info(f"🧭 {source_config['name']} - Static parse failed, trying MCP direct")
+                    mcp_items, diag = await extract_with_mcp_direct(
                         page_url=source_config["url"],
                         selectors=source_config.get("selectors", {}),
                         wait_for=source_config.get("selectors", {}).get("articles"),
                         max_items=settings.max_articles_per_source,
                     )
-                    result.error_details["mcp_bridge"] = diag
+                    result.error_details["mcp_direct"] = diag
                     if mcp_items:
                         for it in mcp_items:
                             try:
@@ -1158,8 +1158,8 @@ class EnhancedUAEScraper:
                         return result
                 except Exception as e:
                     result.status = 'failed'
-                    result.error_details["mcp_bridge_error"] = str(e)
-                    logger.error(f"💥 {source_config['name']} - MCP bridge error: {e}")
+                    result.error_details["mcp_direct_error"] = str(e)
+                    logger.error(f"💥 {source_config['name']} - MCP direct error: {e}")
                     return result
             
             # Post articles with retry logic
