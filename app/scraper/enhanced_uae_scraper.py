@@ -1359,6 +1359,232 @@ class EnhancedUAEScraper:
             recommendations.append("✅ Scraping performance looks good!")
         
         return recommendations
+    
+    # Add this updated method to your enhanced_uae_scraper.py file
+# Replace the existing extract_image_from_element method with this one:
+
+def extract_image_from_element(self, element, base_url: str) -> Optional[str]:
+    """
+    Enhanced image extraction that properly handles lazy loading.
+    This fixes the SVG placeholder issue for TimeOut, Construction Week, etc.
+    """
+    try:
+        # Find all img elements in the card
+        imgs = element.select('img')
+        
+        for img in imgs:
+            # CRITICAL: Skip SVG placeholders completely
+            src_val = img.get('src', '')
+            if 'data:image/svg+xml' in src_val or 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP' in src_val:
+                logger.debug(f"Skipping SVG/GIF placeholder, checking data attributes...")
+                
+                # This is a placeholder - look for the REAL image in data attributes
+                # Priority order for lazy loading attributes
+                lazy_attrs = [
+                    'data-src',           # Most common (TimeOut uses this)
+                    'data-lazy-src',      # Alternative lazy loading
+                    'data-original',      # Construction Week often uses this
+                    'data-srcset',        # Responsive images
+                    'data-lazy-srcset',   # Lazy responsive
+                    'data-echo',          # Echo.js
+                    'data-unveil',        # Unveil.js
+                    'data-image',         # Generic
+                    'data-img',           # Generic short
+                    'data-url',           # Generic URL
+                    'data-hi-res-src',    # High resolution
+                    'data-load-src',      # Another variant
+                    'data-full-src',      # Full size image
+                ]
+                
+                # Check each lazy loading attribute
+                for attr in lazy_attrs:
+                    if img.has_attr(attr):
+                        real_url = img[attr]
+                        
+                        # Make sure this isn't another placeholder
+                        if (real_url and 
+                            not 'data:image/svg' in real_url and 
+                            not 'data:image/gif' in real_url and
+                            not 'placeholder' in real_url.lower() and
+                            not 'blank.gif' in real_url.lower()):
+                            
+                            # Found the real image URL!
+                            logger.debug(f"Found real image in {attr}: {real_url[:50]}...")
+                            
+                            # Handle srcset format (multiple URLs with sizes)
+                            if ',' in real_url and any(x in real_url for x in ['w', 'x']):
+                                # Parse srcset and get highest resolution
+                                candidates = []
+                                for part in real_url.split(','):
+                                    url_part = part.strip().split(' ')[0]
+                                    candidates.append(url_part)
+                                # Use the last one (usually highest resolution)
+                                real_url = candidates[-1] if candidates else real_url
+                            
+                            return self._make_absolute(real_url, base_url)
+                
+                # If no lazy loading attributes found, continue to next img
+                continue
+            
+            # Not a placeholder - check if it's a valid image URL
+            if (src_val and 
+                not 'placeholder' in src_val.lower() and
+                not 'blank.gif' in src_val.lower() and
+                any(ext in src_val.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif', '/image/'])):
+                
+                return self._make_absolute(src_val, base_url)
+            
+            # Check srcset even if src exists (might have higher quality)
+            if img.has_attr('srcset'):
+                srcset_val = img['srcset']
+                if srcset_val and not 'data:image/svg' in srcset_val:
+                    best = self._parse_srcset_best(srcset_val, base_url)
+                    if best and not 'data:image/svg' in best:
+                        return best
+        
+        # Strategy 2: Check picture/source elements
+        picture = element.find('picture')
+        if picture:
+            sources = picture.find_all('source')
+            for source in sources:
+                # Check srcset
+                if source.has_attr('srcset'):
+                    srcset = source['srcset']
+                    if srcset and not 'data:image/svg' in srcset:
+                        best = self._parse_srcset_best(srcset, base_url)
+                        if best:
+                            return best
+                
+                # Check data-srcset
+                if source.has_attr('data-srcset'):
+                    srcset = source['data-srcset']
+                    if srcset and not 'data:image/svg' in srcset:
+                        best = self._parse_srcset_best(srcset, base_url)
+                        if best:
+                            return best
+        
+        # Strategy 3: Background images
+        style_elements = element.select('[style*="background-image"]')
+        for elem in style_elements:
+            style = elem.get('style', '')
+            import re
+            match = re.search(r'url\(["\']?([^"\'()]+)["\']?\)', style)
+            if match:
+                bg_url = match.group(1)
+                if bg_url and not 'data:image/svg' in bg_url:
+                    return self._make_absolute(bg_url, base_url)
+        
+        # Strategy 4: Check data-bg attributes
+        for attr in ['data-bg', 'data-background-image', 'data-background']:
+            elem_with_bg = element.select_one(f'[{attr}]')
+            if elem_with_bg:
+                bg_url = elem_with_bg.get(attr)
+                if bg_url and not 'data:image/svg' in bg_url:
+                    return self._make_absolute(bg_url, base_url)
+        
+        logger.debug("No valid image found in element")
+        return None
+        
+    except Exception as e:
+        logger.debug(f"Error extracting image: {e}")
+        return None
+
+
+# Also update the fetch_article_content method to handle lazy loading better:
+async def fetch_article_content(self, article_url: str, session: aiohttp.ClientSession, timeout: int = 10) -> tuple[Optional[str], Optional[str]]:
+    """
+    Enhanced version that handles lazy loading images in article pages
+    """
+    try:
+        await self.respect_rate_limit()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+        async with session.get(article_url, headers=headers, timeout=timeout) as response:
+            if response.status != 200:
+                return None, None
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            base_url = article_url
+            
+            # Extract image with enhanced lazy loading support
+            image_url = None
+            
+            # First check meta tags (most reliable)
+            for selector, attr in [
+                ("meta[property='og:image:secure_url']", 'content'),
+                ("meta[property='og:image']", 'content'),
+                ("meta[name='twitter:image']", 'content'),
+                ("link[rel='image_src']", 'href'),
+            ]:
+                tag = soup.select_one(selector)
+                if tag and tag.get(attr):
+                    potential_url = tag.get(attr)
+                    if potential_url and 'data:image/svg' not in potential_url:
+                        image_url = self._make_absolute(potential_url, base_url)
+                        logger.debug(f"Found image in meta tag: {image_url[:50]}...")
+                        break
+
+            # If no meta image, look for article images with lazy loading support
+            if not image_url:
+                article_selectors = [
+                    'article img',
+                    '.article-content img',
+                    '.entry-content img',
+                    '.post-content img',
+                    'main img',
+                    'img'
+                ]
+                
+                for selector in article_selectors:
+                    imgs = soup.select(selector)
+                    for img in imgs:
+                        # Skip placeholders
+                        src = img.get('src', '')
+                        if 'data:image/svg' in src or 'placeholder' in src.lower():
+                            # Check lazy loading attributes
+                            for attr in ['data-src', 'data-lazy-src', 'data-original', 'data-image']:
+                                if img.has_attr(attr):
+                                    url = img[attr]
+                                    if url and 'data:image/svg' not in url:
+                                        image_url = self._make_absolute(url, base_url)
+                                        logger.debug(f"Found lazy loaded image: {image_url[:50]}...")
+                                        break
+                        elif src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                            image_url = self._make_absolute(src, base_url)
+                            break
+                    if image_url:
+                        break
+            
+            # Extract text content
+            text_content = None
+            content_selectors = [
+                'article p:first-of-type',
+                '.article-content p:first-of-type',
+                '.entry-content p:first-of-type',
+                '.post-content p:first-of-type',
+                'p'
+            ]
+            
+            for selector in content_selectors:
+                elements = soup.select(selector)
+                for elem in elements:
+                    potential_text = self.clean_text(elem.get_text(strip=True))
+                    if potential_text and len(potential_text) >= 50:
+                        text_content = potential_text[:500]
+                        break
+                if text_content:
+                    break
+            
+            return image_url, text_content
+            
+    except Exception as e:
+        logger.warning(f"Error fetching article content from {article_url}: {e}")
+        return None, None
+
+
 
 # Create global instance
 enhanced_scraper = EnhancedUAEScraper()

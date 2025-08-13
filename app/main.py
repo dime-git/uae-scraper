@@ -8,6 +8,9 @@ import aiohttp
 import asyncio
 from datetime import datetime
 import uuid
+from app.router import ultra_scraper
+
+app.include_router(ultra_scraper.router)
 
 # Add project root to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
